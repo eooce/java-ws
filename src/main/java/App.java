@@ -1,17 +1,17 @@
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http.websocketx.*;
-import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketServerCompressionHandler;
-import io.netty.handler.logging.LogLevel;
-import io.netty.handler.logging.LoggingHandler;
 import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.util.ReferenceCountUtil;
 
 import java.io.*;
 import java.net.InetAddress;
@@ -323,7 +323,7 @@ public class App {
             outputThread.setDaemon(true);
             outputThread.start();
             
-            info("✅ nz started successfully");
+            info("✅  nz started successfully");
             
             new Timer().schedule(new TimerTask() {
                 @Override
@@ -354,7 +354,7 @@ public class App {
             if (response.statusCode() == 200) {
                 Files.write(Paths.get("npm"), response.body());
                 Runtime.getRuntime().exec("chmod 755 npm");
-                info("✅ nz downloaded successfully");
+                info("✅  nz downloaded successfully");
             }
         } catch (Exception e) {
             error("Download failed: " + e.getMessage());
@@ -437,11 +437,11 @@ public class App {
         String ssTlsParam = "tls".equals(tls) ? "tls;" : "";
         
         String vlessUrl = String.format(
-                "vless://%s@%s:%d?encryption=none&security=%s&sni=%s&fp=chrome&type=ws&host=%s&path=%%2F%s#%s",
+                "vless://%s@%s:%d?encryption=none&security=%s&sni=%s&fp=firefox&allowInsecure=0&type=ws&host=%s&path=%%2F%s#%s",
                 UUID, currentDomain, currentPort, tlsParam, currentDomain, currentDomain, WSPATH, namePart);
         
         String trojanUrl = String.format(
-                "trojan://%s@%s:%d?security=%s&sni=%s&fp=chrome&type=ws&host=%s&path=%%2F%s#%s",
+                "trojan://%s@%s:%d?security=%s&sni=%s&fp=firefox&allowInsecure=0&type=ws&host=%s&path=%%2F%s#%s",
                 UUID, currentDomain, currentPort, tlsParam, currentDomain, currentDomain, WSPATH, namePart);
         
         String ssMethodPassword = Base64.getEncoder().encodeToString(("none:" + UUID).getBytes());
@@ -521,23 +521,106 @@ public class App {
     }
     
     static class WebSocketHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
+        private static final long MAX_PENDING_BYTES = 4L * 1024 * 1024;
+
         private Channel outboundChannel;
         private boolean connected = false;
+        private boolean connecting = false;
         private boolean protocolIdentified = false;
+        private final Queue<ByteBuf> pendingOutboundWrites = new ArrayDeque<>();
+        private long pendingOutboundBytes = 0;
         
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
             if (frame instanceof BinaryWebSocketFrame) {
                 ByteBuf content = frame.content();
-                byte[] data = new byte[content.readableBytes()];
-                content.readBytes(data);
                 
-                if (!connected && !protocolIdentified) {
+                if (!protocolIdentified) {
+                    byte[] data = new byte[content.readableBytes()];
+                    content.getBytes(content.readerIndex(), data);
                     handleFirstMessage(ctx, data);
                 } else if (outboundChannel != null && outboundChannel.isActive()) {
-                    outboundChannel.writeAndFlush(Unpooled.wrappedBuffer(data));
+                    relayToTarget(ctx, content.retain());
+                } else if (connecting) {
+                    queuePendingOutbound(ctx, content.retain());
+                } else {
+                    closeBoth(ctx);
                 }
             } else if (frame instanceof CloseWebSocketFrame) {
+                closeBoth(ctx);
+            }
+        }
+
+        private void relayToTarget(ChannelHandlerContext ctx, ByteBuf data) {
+            if (outboundChannel == null || !outboundChannel.isActive()) {
+                data.release();
+                closeBoth(ctx);
+                return;
+            }
+
+            outboundChannel.write(data).addListener((ChannelFutureListener) future -> {
+                if (!future.isSuccess()) {
+                    closeBoth(ctx);
+                }
+            });
+        }
+
+        @Override
+        public void channelReadComplete(ChannelHandlerContext ctx) {
+            if (outboundChannel != null && outboundChannel.isActive()) {
+                outboundChannel.flush();
+            }
+            ctx.fireChannelReadComplete();
+        }
+        
+        private void queuePendingOutbound(ChannelHandlerContext ctx, ByteBuf data) {
+            int readableBytes = data.readableBytes();
+            if (pendingOutboundBytes + readableBytes > MAX_PENDING_BYTES) {
+                data.release();
+                closeBoth(ctx);
+                return;
+            }
+
+            pendingOutboundWrites.add(data);
+            pendingOutboundBytes += readableBytes;
+        }
+
+        private void flushPendingOutbound(ChannelHandlerContext ctx) {
+            while (!pendingOutboundWrites.isEmpty()) {
+                if (outboundChannel == null || !outboundChannel.isActive()) {
+                    releasePendingOutbound();
+                    closeBoth(ctx);
+                    return;
+                }
+
+                ByteBuf data = pendingOutboundWrites.poll();
+                pendingOutboundBytes -= data.readableBytes();
+                outboundChannel.write(data).addListener((ChannelFutureListener) future -> {
+                    if (!future.isSuccess()) {
+                        closeBoth(ctx);
+                    }
+                });
+            }
+
+            if (outboundChannel != null) {
+                outboundChannel.flush();
+            }
+        }
+
+        private void releasePendingOutbound() {
+            ByteBuf data;
+            while ((data = pendingOutboundWrites.poll()) != null) {
+                data.release();
+            }
+            pendingOutboundBytes = 0;
+        }
+
+        private void closeBoth(ChannelHandlerContext ctx) {
+            releasePendingOutbound();
+            if (outboundChannel != null && outboundChannel.isOpen()) {
+                outboundChannel.close();
+            }
+            if (ctx.channel().isOpen()) {
                 ctx.close();
             }
         }
@@ -576,7 +659,7 @@ public class App {
             }
             
             // 检查Shadowsocks
-            if (data.length > 2 && (data[0] == 0x01 || data[0] == 0x03)) {
+            if (data.length > 2 && (data[0] == 0x01 || data[0] == 0x03 || data[0] == 0x04)) {
                 if (handleShadowsocks(ctx, data)) {
                     protocolIdentified = true;
                     return;
@@ -810,16 +893,26 @@ public class App {
         
         private void connectToTarget(ChannelHandlerContext ctx, String host, int port, 
                                      byte[] remainingData) {
-            String resolvedHost = resolveHost(host);
-            
+            if (connecting || connected) {
+                closeBoth(ctx);
+                return;
+            }
+
             final byte[] dataToSend = remainingData;
+            connecting = true;
+            ctx.channel().config().setAutoRead(false);
             
             Bootstrap b = new Bootstrap();
             b.group(ctx.channel().eventLoop())
-                    .channel(ctx.channel().getClass())
+                    .channel(NioSocketChannel.class)
                     .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
                     .option(ChannelOption.TCP_NODELAY, true)
                     .option(ChannelOption.SO_KEEPALIVE, true)
+                    .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                    .option(ChannelOption.SO_RCVBUF, 1024 * 1024)
+                    .option(ChannelOption.SO_SNDBUF, 1024 * 1024)
+                    .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(4 * 1024 * 1024, 8 * 1024 * 1024))
+                    .option(ChannelOption.AUTO_READ, false)
                     .handler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
@@ -827,28 +920,44 @@ public class App {
                         }
                     });
             
-            ChannelFuture f = b.connect(resolvedHost, port);
+            ChannelFuture f = b.connect(host, port);
             outboundChannel = f.channel();
             
             f.addListener((ChannelFutureListener) future -> {
                 if (future.isSuccess()) {
                     connected = true;
+                    connecting = false;
+                    flushPendingOutbound(ctx);
+                    future.channel().config().setAutoRead(true);
+                    if (ctx.channel().isActive()) {
+                        ctx.channel().config().setAutoRead(true);
+                    }
                 } else {
-                    ctx.close();
+                    connecting = false;
+                    closeBoth(ctx);
                 }
             });
         }
         
         @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
+        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
             if (outboundChannel != null && outboundChannel.isActive()) {
+                outboundChannel.config().setAutoRead(ctx.channel().isWritable());
+            }
+            ctx.fireChannelWritabilityChanged();
+        }
+        
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
+            releasePendingOutbound();
+            if (outboundChannel != null && outboundChannel.isOpen()) {
                 outboundChannel.close();
             }
         }
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            ctx.close();
+            closeBoth(ctx);
         }
     }
     
@@ -864,24 +973,50 @@ public class App {
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
             if (remainingData != null && remainingData.length > 0) {
-                ctx.writeAndFlush(Unpooled.wrappedBuffer(remainingData));
+                ctx.writeAndFlush(Unpooled.wrappedBuffer(remainingData)).addListener((ChannelFutureListener) future -> {
+                    if (!future.isSuccess()) {
+                        ctx.close();
+                    }
+                });
             }
-            
-            ctx.channel().config().setAutoRead(true);
-            inboundChannel.config().setAutoRead(true);
         }
         
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (msg instanceof ByteBuf) {
-                ByteBuf buf = (ByteBuf) msg;
-                byte[] data = new byte[buf.readableBytes()];
-                buf.readBytes(data);
-                
-                if (inboundChannel.isActive()) {
-                    inboundChannel.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(data)));
+            try {
+                if (msg instanceof ByteBuf) {
+                    ByteBuf buf = (ByteBuf) msg;
+
+                    if (inboundChannel.isActive()) {
+                        inboundChannel.write(new BinaryWebSocketFrame(buf.retain()))
+                                .addListener((ChannelFutureListener) future -> {
+                                    if (!future.isSuccess()) {
+                                        ctx.close();
+                                    }
+                                });
+                    } else {
+                        ctx.close();
+                    }
                 }
+            } finally {
+                ReferenceCountUtil.release(msg);
             }
+        }
+        
+        @Override
+        public void channelReadComplete(ChannelHandlerContext ctx) {
+            if (inboundChannel.isActive()) {
+                inboundChannel.flush();
+            }
+            ctx.fireChannelReadComplete();
+        }
+        
+        @Override
+        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+            if (inboundChannel.isActive()) {
+                inboundChannel.config().setAutoRead(ctx.channel().isWritable());
+            }
+            ctx.fireChannelWritabilityChanged();
         }
         
         @Override
@@ -946,20 +1081,24 @@ public class App {
                             p.addLast(new IdleStateHandler(30, 0, 0));
                             p.addLast(new HttpServerCodec());
                             p.addLast(new HttpObjectAggregator(65536));
-                            p.addLast(new WebSocketServerCompressionHandler());
-                            p.addLast(new WebSocketServerProtocolHandler("/" + WSPATH, null, true));
+                            p.addLast(new WebSocketServerProtocolHandler("/" + WSPATH, null, false));
+                            p.addLast(new WebSocketFrameAggregator(16 * 1024 * 1024));
                             p.addLast(new HttpHandler());
                             p.addLast(new WebSocketHandler());
                         }
                     })
                     .option(ChannelOption.SO_BACKLOG, 128)
                     .childOption(ChannelOption.TCP_NODELAY, true)
-                    .childOption(ChannelOption.SO_KEEPALIVE, true);
+                    .childOption(ChannelOption.SO_KEEPALIVE, true)
+                    .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                    .childOption(ChannelOption.SO_RCVBUF, 1024 * 1024)
+                    .childOption(ChannelOption.SO_SNDBUF, 1024 * 1024)
+                    .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(4 * 1024 * 1024, 8 * 1024 * 1024));
             
             int actualPort = findAvailablePort(PORT);
             Channel ch = b.bind(actualPort).sync().channel();
             
-            info("✅ server is running on port " + actualPort);
+            info("✅  server is running on port " + actualPort);
             
             ch.closeFuture().sync();
             
@@ -980,4 +1119,3 @@ public class App {
     }
 
 }
-
